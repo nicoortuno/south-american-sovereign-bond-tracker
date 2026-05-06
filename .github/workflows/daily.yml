@@ -1,0 +1,38 @@
+name: Daily Sovereign Risk Monitor
+
+on:
+  schedule:
+    - cron: "30 23 * * 1-5"  # 7:30 PM ET (during DST)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run script
+        run: |
+          python sovereign_risk_monitor.py
+
+      - name: Commit updated CSV
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add raw_daily_market_data.csv
+          git commit -m "Daily data update" || echo "No changes"
+          git push
