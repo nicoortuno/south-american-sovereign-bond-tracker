@@ -4,17 +4,29 @@
 # South American USD sovereign bonds and append/update a CSV.
 #
 # API requests are made exclusively with curl.
-# Python is used only to parse the downloaded local JSON and write CSV.
+# Python is used only to parse downloaded local JSON and write the CSV.
 #
-# Exactly five API calls are made per run:
-#   GET /api/v1/bonds/{ISIN}/analytics
+# Each bond is requested once. When the initial HTTP request fails,
+# that bond is retried one time after a short delay.
 #
-# No history calls and no automatic retries.
+# Normal successful run: 5 API calls
+# Maximum possible run: 10 API calls
+#
+# No history requests are made.
 
 set -u -o pipefail
 
+
+# -------------------------------------------------------------------
+# Configuration
+# -------------------------------------------------------------------
+
 API_BASE="https://bondterminal.com/api/v1"
 OUTPUT_CSV="${OUTPUT_CSV:-data/bondterminal_daily.csv}"
+
+# One initial request plus one retry.
+MAX_ATTEMPTS="${MAX_ATTEMPTS:-2}"
+RETRY_DELAY_SECONDS="${RETRY_DELAY_SECONDS:-10}"
 
 BONDS=(
   "Brazil|brazil|US105756CL22"
@@ -24,10 +36,30 @@ BONDS=(
   "Argentina|argentina|US040114HT09"
 )
 
+
+# -------------------------------------------------------------------
+# Validate required settings
+# -------------------------------------------------------------------
+
 if [[ -z "${BONDTERMINAL_API_KEY:-}" ]]; then
   echo "ERROR: BONDTERMINAL_API_KEY is not loaded." >&2
   exit 1
 fi
+
+if ! [[ "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: MAX_ATTEMPTS must be a positive integer." >&2
+  exit 1
+fi
+
+if ! [[ "$RETRY_DELAY_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: RETRY_DELAY_SECONDS must be a nonnegative integer." >&2
+  exit 1
+fi
+
+
+# -------------------------------------------------------------------
+# Initialize run
+# -------------------------------------------------------------------
 
 RUN_TIMESTAMP_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
@@ -44,6 +76,11 @@ incomplete_run=0
 echo "Collecting BondTerminal data at ${RUN_TIMESTAMP_UTC}"
 echo
 
+
+# -------------------------------------------------------------------
+# Request and process each bond
+# -------------------------------------------------------------------
+
 for entry in "${BONDS[@]}"; do
   IFS="|" read -r country slug isin <<< "$entry"
 
@@ -52,24 +89,45 @@ for entry in "${BONDS[@]}"; do
 
   echo "Requesting ${country}: ${isin}"
 
-  # This is the API call. There is no retry option, so it runs once.
-  http_code="$(
-    curl \
-      --fail-with-body \
-      --silent \
-      --show-error \
-      --max-time 60 \
-      --output "$response_file" \
-      --write-out "%{http_code}" \
-      "$request_url" \
-      -H "Authorization: Bearer ${BONDTERMINAL_API_KEY}" \
-      -H "Accept: application/json"
-  )"
+  request_succeeded=0
+  http_code=""
+  curl_exit_code=0
 
-  curl_exit_code=$?
+  # Request the bond once and retry only when the HTTP request fails.
+  for ((attempt = 1; attempt <= MAX_ATTEMPTS; attempt++)); do
+    rm -f "$response_file"
 
-  if [[ "$curl_exit_code" -ne 0 || "$http_code" != "200" ]]; then
-    echo "  ERROR: curl exit ${curl_exit_code}; HTTP ${http_code}" >&2
+    echo "  Attempt ${attempt}/${MAX_ATTEMPTS}"
+
+    http_code="$(
+      curl \
+        --fail-with-body \
+        --silent \
+        --show-error \
+        --connect-timeout 20 \
+        --max-time 60 \
+        --output "$response_file" \
+        --write-out "%{http_code}" \
+        "$request_url" \
+        -H "Authorization: Bearer ${BONDTERMINAL_API_KEY}" \
+        -H "Accept: application/json"
+    )"
+
+    curl_exit_code=$?
+
+    if [[ "$curl_exit_code" -eq 0 && "$http_code" == "200" ]]; then
+      request_succeeded=1
+
+      if [[ "$attempt" -gt 1 ]]; then
+        echo "  Retry succeeded"
+      fi
+
+      break
+    fi
+
+    echo \
+      "  Attempt ${attempt} failed: curl exit ${curl_exit_code}; HTTP ${http_code}" \
+      >&2
 
     if [[ -s "$response_file" ]]; then
       echo "  Response:" >&2
@@ -77,11 +135,24 @@ for entry in "${BONDS[@]}"; do
       echo >&2
     fi
 
+    if [[ "$attempt" -lt "$MAX_ATTEMPTS" ]]; then
+      echo "  Waiting ${RETRY_DELAY_SECONDS} seconds before retry..."
+      sleep "$RETRY_DELAY_SECONDS"
+    fi
+  done
+
+  if [[ "$request_succeeded" -ne 1 ]]; then
+    echo \
+      "  ERROR: ${country} failed after ${MAX_ATTEMPTS} attempts." \
+      >&2
+
     incomplete_run=1
+    echo
     continue
   fi
 
-  # Parse the local JSON file. This does not make any API request.
+  # Parse the local JSON file.
+  # Python does not make any API or internet requests.
   python3 - \
     "$response_file" \
     "$country" \
@@ -98,12 +169,17 @@ country = sys.argv[2]
 expected_isin = sys.argv[3]
 collection_timestamp_utc = sys.argv[4]
 
+
 try:
     with response_path.open("r", encoding="utf-8") as file:
         payload = json.load(file)
 except (OSError, json.JSONDecodeError) as error:
-    print(f"Invalid JSON for {country}: {error}", file=sys.stderr)
+    print(
+        f"Invalid JSON for {country}: {error}",
+        file=sys.stderr,
+    )
     raise SystemExit(2)
+
 
 if not isinstance(payload, dict):
     print(
@@ -111,6 +187,7 @@ if not isinstance(payload, dict):
         file=sys.stderr,
     )
     raise SystemExit(2)
+
 
 if payload.get("error"):
     print(
@@ -120,15 +197,17 @@ if payload.get("error"):
     )
     raise SystemExit(2)
 
+
 returned_isin = payload.get("isin")
 
 if returned_isin != expected_isin:
     print(
-        f"ISIN mismatch for {country}: expected {expected_isin}, "
-        f"received {returned_isin}",
+        f"ISIN mismatch for {country}: "
+        f"expected {expected_isin}, received {returned_isin}",
         file=sys.stderr,
     )
     raise SystemExit(2)
+
 
 market = payload.get("market") or {}
 yields = payload.get("yields") or {}
@@ -137,6 +216,7 @@ spreads = payload.get("spreads") or {}
 pricing = payload.get("pricing") or {}
 schedule = payload.get("schedule") or {}
 
+
 market_timestamp = market.get("timestamp")
 
 observation_date = (
@@ -144,6 +224,7 @@ observation_date = (
     if market_timestamp is not None
     else None
 )
+
 
 row = {
     "observation_date": observation_date,
@@ -170,6 +251,8 @@ row = {
     "collection_status": None,
 }
 
+
+# These fields must be present for the response to be saved.
 core_fields = [
     "observation_date",
     "market_timestamp",
@@ -179,11 +262,13 @@ core_fields = [
     "ytm_pct",
 ]
 
+
 missing_core = [
     field
     for field in core_fields
     if row.get(field) is None
 ]
+
 
 if missing_core:
     print(
@@ -193,6 +278,9 @@ if missing_core:
     )
     raise SystemExit(2)
 
+
+# These fields are expected, but the row can still be preserved when
+# one is missing. The workflow will then be marked incomplete.
 tracked_fields = [
     "settlement_date",
     "clean_price",
@@ -210,11 +298,13 @@ tracked_fields = [
     "average_life_years",
 ]
 
+
 missing_tracked = [
     field
     for field in tracked_fields
     if row.get(field) is None
 ]
+
 
 if missing_tracked:
     row["collection_status"] = "PARTIAL"
@@ -227,9 +317,10 @@ if missing_tracked:
 else:
     row["collection_status"] = "OK"
 
+
 print(json.dumps(row, ensure_ascii=False))
 
-# Exit 3 means the row was usable and printed, but incomplete.
+# Exit code 3 means the row was printed and is usable, but incomplete.
 raise SystemExit(3 if missing_tracked else 0)
 PY
 
@@ -245,20 +336,31 @@ PY
     incomplete_run=1
 
   else
-    echo "  ERROR: response could not be converted to a row" >&2
+    echo \
+      "  ERROR: ${country} response could not be converted to a row." \
+      >&2
     incomplete_run=1
   fi
+
+  echo
 done
 
-echo
+
+# -------------------------------------------------------------------
+# Confirm that at least one usable row was returned
+# -------------------------------------------------------------------
 
 if [[ ! -s "$ROWS_FILE" ]]; then
   echo "ERROR: No usable bond observations were returned." >&2
   exit 1
 fi
 
-# Merge the new local rows into the CSV.
-# This makes no API calls.
+
+# -------------------------------------------------------------------
+# Merge the new rows into the CSV
+# -------------------------------------------------------------------
+
+# Python reads only local files here and makes no API requests.
 python3 - "$ROWS_FILE" "$OUTPUT_CSV" <<'PY'
 import csv
 import json
@@ -269,6 +371,7 @@ from pathlib import Path
 
 rows_path = Path(sys.argv[1])
 csv_path = Path(sys.argv[2])
+
 
 fieldnames = [
     "observation_date",
@@ -305,9 +408,14 @@ def normalize_row(row):
 
 rows_by_key = {}
 
+
 # Preserve existing observations.
 if csv_path.exists():
-    with csv_path.open("r", encoding="utf-8", newline="") as file:
+    with csv_path.open(
+        "r",
+        encoding="utf-8",
+        newline="",
+    ) as file:
         reader = csv.DictReader(file)
 
         if reader.fieldnames != fieldnames:
@@ -325,7 +433,8 @@ if csv_path.exists():
             if all(key):
                 rows_by_key[key] = normalize_row(row)
 
-# Add or update this run's observations.
+
+# Add or update observations from this run.
 with rows_path.open("r", encoding="utf-8") as file:
     for line in file:
         if not line.strip():
@@ -340,7 +449,7 @@ with rows_path.open("r", encoding="utf-8") as file:
 
         existing = rows_by_key.get(key)
 
-        # Do not replace an existing complete row with a partial row.
+        # Never replace an existing complete row with a partial row.
         if (
             existing
             and existing.get("collection_status") == "OK"
@@ -350,6 +459,7 @@ with rows_path.open("r", encoding="utf-8") as file:
 
         rows_by_key[key] = row
 
+
 sorted_rows = sorted(
     rows_by_key.values(),
     key=lambda row: (
@@ -358,11 +468,17 @@ sorted_rows = sorted(
     ),
 )
 
-csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+csv_path.parent.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
 
 temporary_path = csv_path.with_suffix(
     csv_path.suffix + ".tmp"
 )
+
 
 with temporary_path.open(
     "w",
@@ -373,10 +489,17 @@ with temporary_path.open(
         file,
         fieldnames=fieldnames,
     )
+
     writer.writeheader()
     writer.writerows(sorted_rows)
 
-os.replace(temporary_path, csv_path)
+
+# Replace the original CSV only after the new file is fully written.
+os.replace(
+    temporary_path,
+    csv_path,
+)
+
 
 print(
     f"CSV now contains {len(sorted_rows)} total observation rows."
@@ -386,18 +509,28 @@ PY
 
 merge_exit_code=$?
 
+
 if [[ "$merge_exit_code" -ne 0 ]]; then
   echo "ERROR: CSV update failed." >&2
   exit 1
 fi
 
+
+# -------------------------------------------------------------------
+# Final run status
+# -------------------------------------------------------------------
+
 echo
 echo "Usable bonds saved this run: ${successful_bonds}/5"
 
+
 if [[ "$incomplete_run" -ne 0 || "$successful_bonds" -ne 5 ]]; then
-  echo "Collection was incomplete. Available rows were still saved." >&2
+  echo \
+    "Collection was incomplete. Available rows were still saved." \
+    >&2
   exit 1
 fi
+
 
 echo "All five bonds were collected successfully."
 exit 0
