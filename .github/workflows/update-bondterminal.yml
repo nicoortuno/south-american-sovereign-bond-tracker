@@ -1,0 +1,103 @@
+name: Update BondTerminal Data
+
+run-name: BondTerminal daily market-data update
+
+on:
+  # Adds the manual "Run workflow" button.
+  workflow_dispatch:
+
+  # Runs at 8:17 p.m. Eastern, Monday through Friday.
+  schedule:
+    - cron: "17 20 * * 1-5"
+      timezone: "America/New_York"
+
+# Allows the workflow to commit the updated CSV to the repository.
+permissions:
+  contents: write
+
+# Prevents a scheduled run and a manual run from modifying the CSV
+# at the same time.
+concurrency:
+  group: bondterminal-daily-update
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    name: Collect sovereign bond data
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Make collector executable
+        run: chmod +x scripts/update_bondterminal.sh
+
+      # The collector makes five curl requests.
+      #
+      # continue-on-error allows later steps to preserve and commit
+      # successful observations even when one or more bonds fail.
+      - name: Collect all five bonds
+        id: collection
+        continue-on-error: true
+        env:
+          BONDTERMINAL_API_KEY: ${{ secrets.BONDTERMINAL_API_KEY }}
+        run: ./scripts/update_bondterminal.sh
+
+      # Keep a downloadable copy of the CSV for this particular run.
+      # This is useful even if the repository push later encounters
+      # a permissions or network problem.
+      - name: Upload CSV backup
+        if: always() && hashFiles('data/bondterminal_daily.csv') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: bondterminal-data-${{ github.run_id }}
+          path: data/bondterminal_daily.csv
+          retention-days: 30
+
+      # Commit every usable observation produced by the collector,
+      # including partial runs.
+      - name: Commit all available market data
+        if: always()
+        run: |
+          if [[ ! -f data/bondterminal_daily.csv ]]; then
+            echo "No CSV was created, so there is nothing to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/bondterminal_daily.csv
+
+          if git diff --cached --quiet; then
+            echo "The CSV contains no new repository changes."
+          else
+            RUN_DATE_ET="$(TZ=America/New_York date +%F)"
+
+            git commit \
+              -m "Update BondTerminal data ${RUN_DATE_ET}"
+
+            git push
+          fi
+
+      # Turn the overall workflow red only after the available data
+      # has been preserved.
+      - name: Report incomplete collection
+        if: always()
+        run: |
+          COLLECTION_OUTCOME="${{ steps.collection.outcome }}"
+
+          if [[ "$COLLECTION_OUTCOME" != "success" ]]; then
+            echo "::error title=Incomplete BondTerminal collection::One or more bond requests or required fields failed. All usable observations were preserved in the CSV and committed when possible. Review the 'Collect all five bonds' logs for the country, ISIN, HTTP response, or missing fields."
+            exit 1
+          fi
+
+          echo "All five bonds returned complete observations."

@@ -1,0 +1,1 @@
+observation_date,market_timestamp,collection_timestamp_utc,country,isin,ticker,settlement_date,clean_price,ytm_pct,ytw_pct,current_yield_pct,g_spread_bps,z_spread_bps,treasury_yield_pct,treasury_tenor,modified_duration,effective_duration,convexity,dv01,average_life_years,source,collection_status
